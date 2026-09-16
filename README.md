@@ -6,8 +6,6 @@ that code in an isolated sandbox, and validates the result — retrying with
 targeted feedback when something fails, and refusing to run anything that
 looks unsafe.
 
-## Why multi-agent instead of one agent doing everything
-
 Planner, Coder, and Critic are separate nodes in a state graph rather than
 one LLM call that plans, codes, and judges its own output.
 
