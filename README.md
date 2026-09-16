@@ -1,18 +1,29 @@
 # Multi-Agent Autonomous Data Pipeline
 
-Upgrade of a single-agent "generate Pandas code, `exec()` it, retry on
-traceback" loop into a multi-agent LangGraph pipeline with real sandboxing,
-retrieval, and a separate validation step.
+A multi-agent data analysis system built on LangGraph. Given a natural-language
+query and a dataset, it plans an approach, generates Pandas code, executes
+that code in an isolated sandbox, and validates the result — retrying with
+targeted feedback when something fails, and refusing to run anything that
+looks unsafe.
 
-## What changed from the original, and why
+## Why multi-agent instead of one agent doing everything
 
-| Original | Here | Why |
-|---|---|---|
-| One agent does plan+code+judge output itself | Planner / Coder / Critic are separate nodes | A single LLM call rationalizing its own output is a weak validator; splitting the roles means the Critic sees only the step's contract and the result, not the reasoning that produced it |
-| `exec(code, local_scope)` in-process | Subprocess sandbox: AST allowlist + restricted builtins + CPU/memory/wall-clock limits | The original gives generated code full access to the host process (filesystem, network, arbitrary imports). This is the most important fix in this upgrade — see `tools/sandbox.py` |
-| Retry loop just resends the traceback | Retry passes traceback **and**, if applicable, Critic feedback, and is capped and routed by explicit graph edges | Makes the corrective signal specific instead of "try again," and makes the stop condition explicit state rather than a `for` loop counter |
-| No context beyond `df.head()` | Mock vector-search tool retrieves data-dictionary notes (units, known dedup issues, timezone caveats) before planning | Keeps generated code from silently violating documented data-quality rules |
-| No safety testing | `tests/eval_pipeline.py` asserts 7 known sandbox-escape patterns are blocked at all 3 layers (static scan, sandbox, full graph) | Safety claims are worth nothing until something actually asserts them |
+Planner, Coder, and Critic are separate nodes in a state graph rather than
+one LLM call that plans, codes, and judges its own output.
+
+- **Planner** breaks the user's query into concrete steps before any code is
+  written, so the Coder always works against an explicit, inspectable plan
+  instead of re-deriving intent from scratch on every retry.
+- **Coder** implements one step at a time and only that step.
+- **Critic** reviews the Coder's output against the step's stated
+  expected-output — it never sees the Coder's reasoning, only the code and
+  the result, which makes it a meaningfully independent check rather than
+  the same model re-confirming its own answer.
+
+Separating these roles is deliberate: a single model asked to grade its own
+work is a weak validator, and splitting plan/act/judge into distinct graph
+nodes with their own prompts and their own view of the state is what makes
+self-correction possible at all.
 
 ## Architecture
 
@@ -25,38 +36,100 @@ retriever -> planner -> coder -> executor --(runtime error, retries left)--> cod
               (retries exhausted at either point) -------------------------------> finalize [failed]
 ```
 
-- **`state/schema.py`** — the `PipelineState` TypedDict threaded through every
-  node. List fields (`execution_history`, `artifacts`, `trace`) use an
-  `operator.add` reducer so nodes append rather than overwrite.
-- **`tools/sandbox.py`** — the safety-critical module. Two independent layers:
-  1. **Static**: AST walk rejecting disallowed imports (`os`, `sys`,
-     `subprocess`, `socket`, `importlib`, ...), dunder/escape-hatch names
-     (`__subclasses__`, `__globals__`, `eval`, `exec`, `open`, ...).
-  2. **Runtime**: even if something got past the static layer, code runs in a
-     **separate subprocess** with a restricted `__builtins__` (no `open`,
-     `import`, `getattr`, etc. exposed at all), plus `RLIMIT_CPU` and
-     `RLIMIT_AS` resource limits and a wall-clock `subprocess` timeout — this
-     is what catches non-import-based abuse like infinite loops or memory
-     bombs that the AST layer can't see.
-  - Documented deployment note at the bottom of the file: for a real
-    multi-tenant / internet-facing service, put this behind an OS-level
-    sandbox too (container with dropped capabilities + seccomp, or a
-    microVM). This module is defense-in-depth for a trusted internal tool,
-    not a hard security boundary on its own.
-- **`tools/vector_search.py`** — mock keyword-overlap retriever standing in
-  for a real embedding store; swap `.search()`'s internals for pgvector/
-  Chroma/Pinecone without touching any agent code.
-- **`tools/llm_client.py`** — `GeminiClient` wraps the real API;
-  `FakeLLMClient` returns scripted responses in order, which is what lets
-  `tests/eval_pipeline.py` and the retry-logic test run deterministically
-  with no API key and no network.
-- **`agents/`** — one file per node: `retriever.py` (tool call, no LLM),
-  `planner.py`, `coder.py`, `executor.py` (tool call, no LLM), `critic.py`.
-- **`graph.py`** — builds the `StateGraph`, including the conditional-edge
-  routing functions that implement the retry cap and step advancement.
-- **`orchestrator.py`** — `MultiAgentDataPipeline`, a thin façade
-  (`load_data` / `run_query`) over the compiled graph, for a familiar
-  call site.
+### State management
+
+`state/schema.py` defines `PipelineState`, a single TypedDict threaded
+through every node in the graph. Each node reads what it needs and returns a
+partial update; LangGraph merges these using reducers. List-shaped fields —
+`execution_history`, `artifacts`, `trace` — use an `operator.add` reducer so
+nodes append to a running record instead of overwriting it, which means the
+full history of every attempt (successful or not) survives to the end of the
+run. Scalar fields like `retry_count` and `current_step_index` are plain
+overwrites, since only one node at a time is responsible for advancing them.
+DataFrames themselves are never stored in state — only shape/dtype metadata
+and small string previews — which keeps the state JSON-serializable and
+ready to checkpoint if resumable runs are added later.
+
+### Tools and retrieval
+
+- **Sandbox execution tool** (`tools/sandbox.py`) — the safety-critical
+  component. Two independent layers:
+  1. **Static AST scan**: parses the Coder's generated code and rejects it
+     before execution if it imports disallowed modules (`os`, `sys`,
+     `subprocess`, `socket`, `importlib`, ...) or references known
+     escape-hatch names (`eval`, `exec`, `open`, `__subclasses__`,
+     `__globals__`, `getattr`, ...).
+  2. **Runtime isolation**: code that passes the static check still runs in
+     a separate subprocess with a restricted `__builtins__` (no `open`,
+     `import`, or introspection builtins exposed at all), CPU-time and
+     memory limits via `resource.setrlimit` on Linux/Mac (skipped
+     gracefully on Windows, where `resource` doesn't exist — a wall-clock
+     `subprocess` timeout still applies on every platform). This layer is
+     what catches things the AST scan structurally cannot, like an
+     infinite loop or a memory-exhausting allocation that involves no
+     disallowed names at all.
+
+  This is defense-in-depth for a trusted internal tool, not a hard
+  multi-tenant security boundary — the module's docstring spells out what
+  a production, internet-facing deployment would need on top (containers
+  with dropped capabilities and seccomp filtering, or a microVM).
+
+- **Vector search tool** (`tools/vector_search.py`) — retrieves relevant
+  data-dictionary notes (units, known deduplication issues, timezone
+  caveats) before planning begins, so generated code doesn't silently
+  violate documented data-quality rules. It's currently a keyword-overlap
+  retriever rather than a real embedding index, built specifically so its
+  `.search()` internals can be swapped for pgvector/Chroma/Pinecone without
+  changing any agent code — the interface is real, the backing retrieval
+  method is a placeholder.
+
+- **LLM client** (`tools/llm_client.py`) — a small `generate(system, user)`
+  interface. `GeminiClient` wraps the real Gemini API; `FakeLLMClient`
+  returns scripted responses in order and requires no API key or network
+  access, which is what makes the evaluation suite deterministic and
+  runnable in CI.
+
+### Failure handling and self-correction
+
+Two distinct failure paths, routed by explicit conditional edges in the
+graph rather than a bare `for` loop with a counter:
+
+1. **Sandbox rejects the code as unsafe** → the run terminates immediately
+   as `unsafe_terminated`. This is intentionally not treated as a retryable
+   error — unsafe code isn't a mistake to correct, it's a stop condition.
+2. **Code runs but throws at runtime, or the Critic rejects the result** →
+   routes back to the Coder with the specific failure attached: the actual
+   traceback for a runtime error, or the Critic's stated reason for a
+   rejection. The Coder's next attempt is generated with that context, not
+   a bare "try again." Retries are capped (`max_retries`, default 3) and
+   tracked as state (`retry_count`), so the stop condition is explicit and
+   inspectable rather than implicit in loop structure.
+
+### Evaluation strategy
+
+`tests/eval_pipeline.py` is a standalone script (no API key or network
+required, via `FakeLLMClient`) that asserts three things:
+
+1. **Functional correctness** — two scripted query/response sequences each
+   reach `status == "success"` with the expected output.
+2. **Safety** — seven known sandbox-escape code samples (direct file read,
+   `os` import, `importlib`-mediated `os` access, `eval`-based escape,
+   dunder `__subclasses__` traversal, raw socket creation, `subprocess`
+   call) are each asserted blocked at all three checkpoints: the static AST
+   scan directly, the sandbox's end-to-end `run_in_sandbox` call, and the
+   full graph reaching `status == "unsafe_terminated"` rather than being
+   silently absorbed as a generic failure. That's 21 separate assertions,
+   all currently passing.
+3. **Retry recovery** — a deliberately broken first attempt (a typo'd
+   column name, producing a real `KeyError`) is asserted to generate
+   exactly one `runtime_error` history entry before a corrected attempt
+   succeeds, which proves the retry edge actually engages rather than just
+   being reachable in the graph definition.
+
+Separately, `tools/sandbox.py`'s resource limits have been exercised
+directly against an infinite loop and a memory-allocating script to confirm
+the runtime isolation layer — not just the AST layer — independently kills
+code that no import-based static check could ever catch.
 
 ## Usage
 
@@ -67,9 +140,9 @@ pipeline = MultiAgentDataPipeline(api_key="...", model="gemini-2.5-flash")
 pipeline.load_data("sales.csv")
 final_state = pipeline.run_query("What's the month-over-month revenue trend by region?")
 
-print(final_state["status"])        # "success" | "failed" | "unsafe_terminated"
+print(final_state["status"])              # "success" | "failed" | "unsafe_terminated"
 print(final_state["final_answer"])
-print(final_state["execution_history"])  # every attempt, including failed ones
+print(final_state["execution_history"])   # every attempt, including failed ones
 ```
 
 ## Running the evaluation suite
@@ -79,40 +152,23 @@ pip install -r requirements.txt
 python -m tests.eval_pipeline
 ```
 
-No API key needed — it uses `FakeLLMClient` with scripted planner/coder/critic
-responses. It asserts:
+No API key needed. Current output: 2/2 functional cases pass, 21/21 safety
+assertions pass, retry recovery confirmed.
 
-1. **Functional cases** — two scripted query/response pairs reach
-   `status == "success"`.
-2. **Safety cases** — seven known sandbox-escape code samples (file read,
-   `os` import, `importlib`-mediated `os` access, `eval`-based escape, dunder
-   `__subclasses__` traversal, raw socket, `subprocess`) are each asserted
-   blocked at all three checkpoints: the static AST scan directly, the
-   sandbox's end-to-end `run_in_sandbox`, and the full graph reaching
-   `status == "unsafe_terminated"` (not silently swallowed as a generic
-   failure).
-3. **Retry case** — a deliberately broken first attempt (typo'd column name)
-   is asserted to produce exactly one `runtime_error` history entry before
-   the scripted corrected code succeeds, proving the coder↔executor retry
-   edge actually engages instead of just being reachable in principle.
-
-Separately (not part of the scripted eval, since it takes real wall-clock
-time), `tools/sandbox.py`'s resource limits can be exercised directly against
-an infinite loop or a memory-bomb script to confirm the *runtime* layer — not
-just the AST layer — independently kills unsafe code that no import-based
-static check could ever catch.
-
-## Known limitations / things to harden further for production
+## Known limitations
 
 - The subprocess sandbox is not a substitute for OS-level isolation
-  (containers/seccomp/microVM) if this is ever exposed multi-tenant or to
-  untrusted users — see the note in `tools/sandbox.py`.
-- `MockVectorStore` is keyword-overlap, not embeddings; swap in a real vector
-  DB when you have actual data-dictionary content to index.
-- `PipelineState` is JSON-serializable by design (DataFrames are never put in
-  state, only string previews) so it can be checkpointed with LangGraph's
-  persistence layer if you want resumable runs — this repo doesn't wire up a
-  checkpointer, but the state shape is ready for one.
-- Chart/table artifact capture (`Artifact` in `state/schema.py`) is modeled in
-  the schema but the Coder prompt doesn't yet instruct the model to register
-  artifacts — wire that up if you need chart outputs, not just printed text.
+  (containers, seccomp, microVM) if this were ever exposed to untrusted
+  multi-tenant users — see the deployment note in `tools/sandbox.py`.
+- CPU/memory resource limits are POSIX-only and silently no-op on Windows;
+  the wall-clock timeout still applies everywhere, but a memory-heavy
+  script on Windows won't be capped until it hits that timeout.
+- `MockVectorStore` is a keyword-overlap stand-in, not a real embedding
+  index — swap in an actual vector DB when there's real documentation
+  content to index.
+- `PipelineState` is JSON-serializable by design specifically so it could
+  be checkpointed with LangGraph's persistence layer for resumable runs,
+  but no checkpointer is wired up yet.
+- The `Artifact` type in `state/schema.py` models chart/table output, but
+  the Coder's prompt doesn't yet instruct it to populate one — currently
+  only printed text results are captured.
