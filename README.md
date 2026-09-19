@@ -1,5 +1,14 @@
 # Multi-Agent Autonomous Data Pipeline
 
+## Quick start (no API key needed)
+```bash
+git clone https://github.com/austinfutures/data_pipeline_agent.git
+cd data_pipeline_agent
+pip install -r requirements.txt
+python -m tests.eval_pipeline
+```
+Expected: 2/2 functional cases, 21/21 safety assertions, retry recovery confirmed.
+
 A multi-agent data analysis system built on LangGraph. Given a natural-language
 query and a dataset, it plans an approach, generates Pandas code, executes
 that code in an isolated sandbox, and validates the result — retrying with
